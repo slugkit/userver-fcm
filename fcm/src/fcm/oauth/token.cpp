@@ -15,7 +15,6 @@ namespace json = userver::formats::json;
 
 namespace {
 
-constexpr std::string_view kTokenUrl = "https://oauth2.googleapis.com/token";
 constexpr std::string_view kScope = "https://www.googleapis.com/auth/firebase.messaging";
 constexpr auto kJwtLifetime = std::chrono::seconds{3600};
 
@@ -23,21 +22,20 @@ auto Base64UrlEncode(std::string_view data) -> std::string {
     return userver::crypto::base64::Base64UrlEncode(data, userver::crypto::base64::Pad::kWithout);
 }
 
-auto BuildSignedJwt(std::string_view client_email, std::string_view private_key_pem) -> std::string {
+auto BuildSignedJwt(std::string_view client_email, std::string_view private_key_pem, std::string_view token_url)
+    -> std::string {
     json::ValueBuilder header_builder;
     header_builder["alg"] = "RS256";
     header_builder["typ"] = "JWT";
     auto header = json::ToString(header_builder.ExtractValue());
 
-    auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                   userver::utils::datetime::Now().time_since_epoch()
-    )
-                   .count();
+    auto now =
+        std::chrono::duration_cast<std::chrono::seconds>(userver::utils::datetime::Now().time_since_epoch()).count();
 
     json::ValueBuilder claims_builder;
     claims_builder["iss"] = client_email;
     claims_builder["scope"] = kScope;
-    claims_builder["aud"] = kTokenUrl;
+    claims_builder["aud"] = std::string{token_url};
     claims_builder["iat"] = now;
     claims_builder["exp"] = now + kJwtLifetime.count();
     auto claims = json::ToString(claims_builder.ExtractValue());
@@ -58,18 +56,15 @@ auto BuildSignedJwt(std::string_view client_email, std::string_view private_key_
 auto ObtainAccessToken(
     userver::clients::http::Client& http_client,
     std::string_view client_email,
-    std::string_view private_key_pem
+    std::string_view private_key_pem,
+    std::string_view token_url
 ) -> AccessToken {
-    auto jwt = BuildSignedJwt(client_email, private_key_pem);
+    auto jwt = BuildSignedJwt(client_email, private_key_pem, token_url);
 
-    auto body = fmt::format(
-        "grant_type={}&assertion={}",
-        "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer",
-        jwt
-    );
+    auto body = fmt::format("grant_type={}&assertion={}", "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer", jwt);
 
     auto response = http_client.CreateRequest()
-                        .post(std::string{kTokenUrl}, body)
+                        .post(std::string{token_url}, body)
                         .headers({{"Content-Type", "application/x-www-form-urlencoded"}})
                         .timeout(std::chrono::seconds{10})
                         .perform();

@@ -19,12 +19,13 @@ namespace fcm {
 
 namespace {
 
-constexpr std::string_view kFcmUrlTemplate = "https://fcm.googleapis.com/v1/projects/{}/messages:send";
+constexpr std::string_view kDefaultBaseUrl = "https://fcm.googleapis.com";
+constexpr std::string_view kDefaultTokenUrl = "https://oauth2.googleapis.com/token";
 constexpr auto kDefaultRefreshMargin = std::chrono::minutes{5};
 constexpr auto kDefaultRequestTimeout = std::chrono::seconds{10};
 
-auto FcmUrl(std::string_view project_id) -> std::string {
-    return fmt::format(kFcmUrlTemplate, project_id);
+auto FcmUrl(std::string_view base_url, std::string_view project_id) -> std::string {
+    return fmt::format("{}/v1/projects/{}/messages:send", base_url, project_id);
 }
 
 auto DoSend(
@@ -35,7 +36,9 @@ auto DoSend(
     std::chrono::milliseconds timeout
 ) -> SendResult {
     if (notification.device_token.empty()) {
-        return SendResult{.status_code = 400, .message_name = {}, .error_code = {}, .error_message = "Empty device_token"};
+        return SendResult{
+            .status_code = 400, .message_name = {}, .error_code = {}, .error_message = "Empty device_token"
+        };
     }
 
     namespace json = userver::formats::json;
@@ -105,6 +108,8 @@ auto DoSend(
 struct Client::Impl {
     userver::components::HttpClient& http_client;
     Credentials credentials;
+    std::string base_url;
+    std::string token_url;
     std::string fcm_url;
     std::chrono::milliseconds request_timeout;
     std::chrono::seconds refresh_margin;
@@ -112,13 +117,12 @@ struct Client::Impl {
     userver::rcu::Variable<std::string> access_token;
     userver::utils::PeriodicTask refresh_task;
 
-    Impl(
-        const userver::components::ComponentConfig& config,
-        const userver::components::ComponentContext& context
-    )
+    Impl(const userver::components::ComponentConfig& config, const userver::components::ComponentContext& context)
         : http_client(context.FindComponent<userver::components::HttpClient>())
         , credentials(Credentials::FromConfig(config))
-        , fcm_url(FcmUrl(credentials.project_id))
+        , base_url(config["base-url"].As<std::string>(std::string{kDefaultBaseUrl}))
+        , token_url(config["oauth-token-url"].As<std::string>(std::string{kDefaultTokenUrl}))
+        , fcm_url(FcmUrl(base_url, credentials.project_id))
         , request_timeout(config["request-timeout"].As<std::chrono::milliseconds>(kDefaultRequestTimeout))
         , refresh_margin(config["token-refresh-margin"].As<std::chrono::seconds>(kDefaultRefreshMargin)) {
         if (credentials.project_id.empty()) {
@@ -139,11 +143,13 @@ struct Client::Impl {
         RefreshToken();
     }
 
-    ~Impl() { refresh_task.Stop(); }
+    ~Impl() {
+        refresh_task.Stop();
+    }
 
     void RefreshToken() {
         auto result = oauth::ObtainAccessToken(
-            http_client.GetHttpClient(), credentials.client_email, credentials.private_key_pem
+            http_client.GetHttpClient(), credentials.client_email, credentials.private_key_pem, token_url
         );
         access_token.Assign(std::move(result.token));
 
@@ -155,8 +161,7 @@ struct Client::Impl {
 
         refresh_task.Start(
             "fcm-token-refresh",
-            userver::utils::PeriodicTask::Settings{
-                std::chrono::duration_cast<std::chrono::milliseconds>(next_refresh)},
+            userver::utils::PeriodicTask::Settings{std::chrono::duration_cast<std::chrono::milliseconds>(next_refresh)},
             [this] { RefreshToken(); }
         );
     }
@@ -167,21 +172,18 @@ struct Client::Impl {
     }
 
     auto Send(const Credentials& creds, const Notification& notification) const -> SendResult {
-        auto result = oauth::ObtainAccessToken(
-            http_client.GetHttpClient(), creds.client_email, creds.private_key_pem
-        );
+        auto result =
+            oauth::ObtainAccessToken(http_client.GetHttpClient(), creds.client_email, creds.private_key_pem, token_url);
         return DoSend(
-            http_client.GetHttpClient(), FcmUrl(creds.project_id), result.token, notification, request_timeout
+            http_client.GetHttpClient(), FcmUrl(base_url, creds.project_id), result.token, notification, request_timeout
         );
     }
 };
 
-Client::Client(
-    const userver::components::ComponentConfig& config,
-    const userver::components::ComponentContext& context
-)
+Client::Client(const userver::components::ComponentConfig& config, const userver::components::ComponentContext& context)
     : userver::components::ComponentBase(config, context)
-    , impl_{config, context} {}
+    , impl_{config, context} {
+}
 
 Client::~Client() = default;
 
@@ -200,6 +202,14 @@ properties:
     private-key-pem:
         type: string
         description: RSA private key from service account JSON
+    base-url:
+        type: string
+        description: FCM API base URL (override for testing / proxying)
+        defaultDescription: https://fcm.googleapis.com
+    oauth-token-url:
+        type: string
+        description: OAuth2 token endpoint URL (override for testing / proxying)
+        defaultDescription: https://oauth2.googleapis.com/token
     token-refresh-margin:
         type: string
         description: Refresh token this long before expiry
