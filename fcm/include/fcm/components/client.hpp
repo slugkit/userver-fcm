@@ -24,7 +24,7 @@ public:
     [[nodiscard]] auto Send(const Credentials& credentials, const Notification& notification) const -> SendResult;
 
 private:
-    constexpr static auto kImplSize = 784UL;
+    constexpr static auto kImplSize = 960UL;
     constexpr static auto kImplAlign = 16UL;
     struct Impl;
     userver::utils::FastPimpl<Impl, kImplSize, kImplAlign> impl_;
