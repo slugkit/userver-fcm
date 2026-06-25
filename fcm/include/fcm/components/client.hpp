@@ -14,23 +14,17 @@ class Client final : public userver::components::ComponentBase {
 public:
     static constexpr std::string_view kName = "fcm-client";
 
-    Client(
-        const userver::components::ComponentConfig& config,
-        const userver::components::ComponentContext& context
-    );
+    Client(const userver::components::ComponentConfig& config, const userver::components::ComponentContext& context);
     ~Client();
 
     static auto GetStaticConfigSchema() -> userver::yaml_config::Schema;
 
     [[nodiscard]] auto Send(const Notification& notification) const -> SendResult;
 
-    [[nodiscard]] auto Send(
-        const Credentials& credentials,
-        const Notification& notification
-    ) const -> SendResult;
+    [[nodiscard]] auto Send(const Credentials& credentials, const Notification& notification) const -> SendResult;
 
 private:
-    constexpr static auto kImplSize = 720UL;
+    constexpr static auto kImplSize = 784UL;
     constexpr static auto kImplAlign = 16UL;
     struct Impl;
     userver::utils::FastPimpl<Impl, kImplSize, kImplAlign> impl_;
