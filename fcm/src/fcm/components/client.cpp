@@ -125,6 +125,18 @@ struct Client::Impl {
         , fcm_url(FcmUrl(base_url, credentials.project_id))
         , request_timeout(config["request-timeout"].As<std::chrono::milliseconds>(kDefaultRequestTimeout))
         , refresh_margin(config["token-refresh-margin"].As<std::chrono::seconds>(kDefaultRefreshMargin)) {
+        // The default credential is optional: a consumer that only ever calls
+        // the per-credential Send(creds, ...) overload (e.g. a multi-tenant
+        // dispatcher) can register the client with no project-id/client-email/
+        // private-key-pem and skip the start-up token refresh entirely.
+        const bool has_default_credential = !credentials.project_id.empty() || !credentials.client_email.empty() ||
+                                            !credentials.private_key_pem.empty();
+        if (!has_default_credential) {
+            LOG_INFO() << "fcm-client: no default credential configured; per-credential Send only";
+            return;
+        }
+
+        // When any default field is set, all three are required.
         if (credentials.project_id.empty()) {
             throw std::runtime_error("fcm-client: project-id is not configured (set FCM_PROJECT_ID)");
         }
