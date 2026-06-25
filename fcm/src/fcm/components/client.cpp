@@ -6,6 +6,8 @@
 #include <userver/clients/http/component.hpp>
 #include <userver/components/component_config.hpp>
 #include <userver/components/component_context.hpp>
+#include <userver/concurrent/variable.hpp>
+#include <userver/crypto/hash.hpp>
 #include <userver/crypto/signers.hpp>
 #include <userver/formats/json/serialize.hpp>
 #include <userver/formats/json/value.hpp>
@@ -14,6 +16,9 @@
 #include <userver/rcu/rcu.hpp>
 #include <userver/utils/periodic_task.hpp>
 #include <userver/yaml_config/merge_schemas.hpp>
+
+#include <chrono>
+#include <unordered_map>
 
 namespace fcm {
 
@@ -26,6 +31,13 @@ constexpr auto kDefaultRequestTimeout = std::chrono::seconds{10};
 
 auto FcmUrl(std::string_view base_url, std::string_view project_id) -> std::string {
     return fmt::format("{}/v1/projects/{}/messages:send", base_url, project_id);
+}
+
+// Stable cache key for a service-account credential. Includes the private key
+// so a rotated credential (same email/project, new key) gets a fresh token
+// rather than reusing the stale one. Hashed, so no key material is retained.
+auto CredentialCacheKey(const Credentials& creds) -> std::string {
+    return userver::crypto::hash::Sha256(creds.client_email + '\n' + creds.project_id + '\n' + creds.private_key_pem);
 }
 
 auto DoSend(
@@ -117,6 +129,16 @@ struct Client::Impl {
     userver::rcu::Variable<std::string> access_token;
     userver::utils::PeriodicTask refresh_task;
 
+    // Per-credential OAuth token cache for the multi-tenant Send(creds, ...)
+    // path: a fresh OAuth round-trip to Google for every notification is the
+    // dominant per-send cost, so cache each service account's access token until
+    // shortly before it expires. Keyed by CredentialCacheKey.
+    struct CachedToken {
+        std::string token;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    mutable userver::concurrent::Variable<std::unordered_map<std::string, CachedToken>> token_cache;
+
     Impl(const userver::components::ComponentConfig& config, const userver::components::ComponentContext& context)
         : http_client(context.FindComponent<userver::components::HttpClient>())
         , credentials(Credentials::FromConfig(config))
@@ -184,11 +206,44 @@ struct Client::Impl {
     }
 
     auto Send(const Credentials& creds, const Notification& notification) const -> SendResult {
+        return DoSend(
+            http_client.GetHttpClient(),
+            FcmUrl(base_url, creds.project_id),
+            AccessTokenFor(creds),
+            notification,
+            request_timeout
+        );
+    }
+
+    // Return a cached OAuth access token for this credential, obtaining (and
+    // caching) a fresh one on a miss or near-expiry. The OAuth round-trip
+    // happens outside the lock so concurrent sends to different apps don't
+    // serialize; a rare double-fetch on simultaneous misses is harmless.
+    auto AccessTokenFor(const Credentials& creds) const -> std::string {
+        const auto key = CredentialCacheKey(creds);
+        const auto now = std::chrono::steady_clock::now();
+        {
+            auto cache = token_cache.Lock();
+            auto it = cache->find(key);
+            if (it != cache->end() && now < it->second.deadline) {
+                return it->second.token;
+            }
+        }
+
         auto result =
             oauth::ObtainAccessToken(http_client.GetHttpClient(), creds.client_email, creds.private_key_pem, token_url);
-        return DoSend(
-            http_client.GetHttpClient(), FcmUrl(base_url, creds.project_id), result.token, notification, request_timeout
-        );
+        auto ttl = result.expires_in - refresh_margin;
+        if (ttl.count() <= 0) {
+            ttl = std::chrono::seconds{60};
+        }
+        const auto deadline = std::chrono::steady_clock::now() + ttl;
+        {
+            auto cache = token_cache.Lock();
+            // Drop expired entries so the map stays bounded by the live app set.
+            std::erase_if(*cache, [&](const auto& kv) { return now >= kv.second.deadline; });
+            (*cache)[key] = CachedToken{result.token, deadline};
+        }
+        return result.token;
     }
 };
 
